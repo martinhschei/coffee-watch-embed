@@ -155,7 +155,7 @@ int main() {
         if (!ok) log_warn("Upload failed for shot #" + std::to_string(shot));
 
         // Countdown sleep so you see it's alive
-        for (int s = 20; s > 0 && !g_stop; --s) {
+        for (int s = 45; s > 0 && !g_stop; --s) {
             std::cerr << ts() << " [INFO]  Sleeping … " << s << "s     \r" << std::flush;
             std::this_thread::sleep_for(std::chrono::seconds(1));
         }
