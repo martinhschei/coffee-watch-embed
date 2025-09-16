@@ -142,6 +142,9 @@ int main() {
     while (!g_stop) {
         log_info("Capturing frame for shot #" + std::to_string(shot));
         cv::Mat frame;
+        for (int i = 0; i < 5; i++) {
+            cap.grab(); // just grab without decoding
+        }
         if (!cap.read(frame) || frame.empty()) {
             log_warn("Failed to read frame; retrying in 5s …");
             std::this_thread::sleep_for(std::chrono::seconds(5));
@@ -165,7 +168,6 @@ int main() {
         bool ok = post_image(jpg, shot);
         if (!ok) log_warn("Upload failed for shot #" + std::to_string(shot));
 
-        // 20s countdown so you can see it's alive
         for (int s = 20; s > 0 && !g_stop; --s) {
             std::cerr << ts() << " [INFO]  Sleeping … " << s << "s     \r" << std::flush;
             std::this_thread::sleep_for(std::chrono::seconds(1));
