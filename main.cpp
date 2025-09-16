@@ -1,6 +1,4 @@
-// g++ -std=c++17 capture_uploader.cpp -o capture_uploader \
-//     `pkg-config --cflags --libs opencv4 libcurl`
-//
+// g++ -std=c++17 capture_uploader.cpp -o capture_uploader `pkg-config --cflags --libs opencv4 libcurl`
 // Run: ./capture_uploader
 
 #include <opencv2/opencv.hpp>
@@ -10,24 +8,62 @@
 #include <iostream>
 #include <vector>
 #include <string>
+#include <iomanip>
+#include <signal.h>
 
-static bool post_image(const std::vector<uchar>& jpg, int shotIndex) {
-    std::cout << "[INFO] Starting upload for shot #" << shotIndex
-              << " (" << jpg.size() << " bytes)\n";
+// -------- CONFIG: choose ONE of these --------
+// #define USE_USB_CAM            // uncomment to try /dev/video0
+#define USE_LIBCAMERA_GSTREAMER   // default for Pi cam via libcamera
+
+static std::string ts() {
+    using namespace std::chrono;
+    auto now = system_clock::now();
+    auto t = system_clock::to_time_t(now);
+    auto ms = duration_cast<milliseconds>(now.time_since_epoch()) % 1000;
+    std::tm tm{};
+#if defined(_WIN32)
+    localtime_s(&tm, &t);
+#else
+    localtime_r(&t, &tm);
+#endif
+    std::ostringstream oss;
+    oss << std::put_time(&tm, "%Y-%m-%d %H:%M:%S")
+        << "." << std::setw(3) << std::setfill('0') << ms.count();
+    return oss.str();
+}
+
+static void log_info(const std::string& m){ std::cerr << ts() << " [INFO]  " << m << "\n"; }
+static void log_warn(const std::string& m){ std::cerr << ts() << " [WARN]  " << m << "\n"; }
+static void log_err (const std::string& m){ std::cerr << ts() << " [ERROR] " << m << "\n"; }
+static void log_ok  (const std::string& m){ std::cerr << ts() << " [OK]    " << m << "\n"; }
+
+static volatile sig_atomic_t g_stop = 0;
+static void on_sigint(int){ g_stop = 1; }
+
+static size_t write_cb(char* ptr, size_t sz, size_t nm, void* ud){
+    auto* s = static_cast<std::string*>(ud);
+    s->append(ptr, sz*nm);
+    return sz*nm;
+}
+
+static bool post_image(const std::vector<uchar>& jpg, int shot) {
+    log_info("Preparing POST for shot #" + std::to_string(shot) + " (" + std::to_string(jpg.size()) + " bytes)");
 
     CURL* curl = curl_easy_init();
-    if (!curl) {
-        std::cerr << "[ERROR] Failed to init curl\n";
-        return false;
-    }
+    if (!curl) { log_err("curl_easy_init failed"); return false; }
 
-    curl_easy_setopt(curl, CURLOPT_URL,
-        "https://coffee-maker.apifortytwo.com/api/observation");
+    curl_easy_setopt(curl, CURLOPT_URL, "https://coffee-maker.apifortytwo.com/api/observation");
     curl_easy_setopt(curl, CURLOPT_USERAGENT, "coffee-rpi/1.0");
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 20L);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
     curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, 1L);
+    curl_easy_setopt(curl, CURLOPT_VERBOSE, 1L); // libcurl debug to stderr
 
-    // Build multipart form with one "image" field
+    // If you need auth, uncomment:
+    // struct curl_slist* headers = nullptr;
+    // headers = curl_slist_append(headers, "Authorization: Bearer YOUR_TOKEN_HERE");
+    // curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+
+    // multipart: single field "image"
     curl_mime* mime = curl_mime_init(curl);
     curl_mimepart* part = curl_mime_addpart(mime);
     curl_mime_name(part, "image");
@@ -36,85 +72,97 @@ static bool post_image(const std::vector<uchar>& jpg, int shotIndex) {
     curl_mime_type(part, "image/jpeg");
     curl_easy_setopt(curl, CURLOPT_MIMEPOST, mime);
 
-    // Capture response text
     std::string resp;
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION,
-        +[](char* ptr, size_t sz, size_t nm, void* ud)->size_t {
-            reinterpret_cast<std::string*>(ud)->append(ptr, sz * nm);
-            return sz * nm;
-        });
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_cb);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &resp);
 
-    std::cout << "[INFO] Sending POST request...\n";
+    log_info("Sending POST …");
     CURLcode rc = curl_easy_perform(curl);
 
-    long code = 0;
-    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
+    long http = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http);
 
     // cleanup
     curl_mime_free(mime);
+    // if (headers) curl_slist_free_all(headers);
     curl_easy_cleanup(curl);
 
     if (rc != CURLE_OK) {
-        std::cerr << "[ERROR] curl_easy_perform failed: "
-                  << curl_easy_strerror(rc) << "\n";
+        log_err(std::string("POST failed: ") + curl_easy_strerror(rc));
         return false;
     }
 
-    std::cout << "[INFO] POST returned HTTP " << code << "\n";
-    std::cout << "[INFO] Response body:\n" << resp << "\n";
-
-    return code >= 200 && code < 300;
+    std::cerr << ts() << " [INFO]  HTTP status: " << http << "\n";
+    std::cerr << ts() << " [INFO]  Response body: " << (resp.empty()? "<empty>" : resp) << "\n";
+    if (http >= 200 && http < 300) {
+        log_ok("Upload success (shot #" + std::to_string(shot) + ")");
+        return true;
+    } else {
+        log_warn("Non-2xx response for shot #" + std::to_string(shot));
+        return false;
+    }
 }
 
 int main() {
-    // Pi cam via GStreamer (libcamera).
+    signal(SIGINT, on_sigint);
+    log_info("Starting capture_uploader (interval 20s)");
+
+#if defined(USE_USB_CAM)
+    cv::VideoCapture cap(0);
+    log_info("Opening camera: device index 0 (USB)");
+#elif defined(USE_LIBCAMERA_GSTREAMER)
     std::string pipeline =
         "libcamerasrc ! video/x-raw,width=1280,height=720,framerate=30/1 ! "
         "videoconvert ! appsink";
-
-    // For USB cam: cv::VideoCapture cap(0);
     cv::VideoCapture cap(pipeline, cv::CAP_GSTREAMER);
+    log_info("Opening camera: GStreamer pipeline via libcamera");
+#else
+#error "Select a capture source (USE_USB_CAM or USE_LIBCAMERA_GSTREAMER)"
+#endif
+
     if (!cap.isOpened()) {
-        std::cerr << "[FATAL] Could not open camera\n";
+        log_err("Could not open camera (is OpenCV built with the right backend?)");
+        log_info("Tip: try switching to USE_USB_CAM or install GStreamer/libcamera support.");
         return 1;
     }
+    log_ok("Camera opened");
 
-    std::cout << "[INFO] Camera opened successfully\n";
     int shot = 0;
-
-    while (true) {
-        std::cout << "[INFO] Capturing frame for shot #" << shot << "...\n";
+    while (!g_stop) {
+        log_info("Capturing frame for shot #" + std::to_string(shot));
         cv::Mat frame;
         if (!cap.read(frame) || frame.empty()) {
-            std::cerr << "[WARN] Failed to read frame; retrying in 5s...\n";
+            log_warn("Failed to read frame; retrying in 5s …");
             std::this_thread::sleep_for(std::chrono::seconds(5));
             continue;
         }
 
-        std::cout << "[INFO] Frame captured: "
-                  << frame.cols << "x" << frame.rows
-                  << " (" << frame.total() * frame.elemSize() << " bytes raw)\n";
+        log_ok("Frame captured: " + std::to_string(frame.cols) + "x" + std::to_string(frame.rows) +
+               ", raw ~" + std::to_string(frame.total() * frame.elemSize()) + " bytes");
 
-        // JPEG encode in memory
+        // JPEG encode
         std::vector<uchar> jpg;
         std::vector<int> params = {cv::IMWRITE_JPEG_QUALITY, 85};
         if (!cv::imencode(".jpg", frame, jpg, params)) {
-            std::cerr << "[ERROR] JPEG encode failed\n";
+            log_err("JPEG encode failed; retrying in 5s …");
             std::this_thread::sleep_for(std::chrono::seconds(5));
             continue;
         }
+        log_info("JPEG encoded: " + std::to_string(jpg.size()) + " bytes");
 
         // Upload
         bool ok = post_image(jpg, shot);
-        if (ok) {
-            std::cout << "[SUCCESS] Shot #" << shot << " uploaded successfully\n";
-        } else {
-            std::cerr << "[FAIL] Shot #" << shot << " upload failed\n";
-        }
+        if (!ok) log_warn("Upload failed for shot #" + std::to_string(shot));
 
-        shot++;
-        std::cout << "[INFO] Sleeping 20s before next capture...\n\n";
-        std::this_thread::sleep_for(std::chrono::seconds(20));
+        // Countdown sleep so you see it's alive
+        for (int s = 20; s > 0 && !g_stop; --s) {
+            std::cerr << ts() << " [INFO]  Sleeping … " << s << "s     \r" << std::flush;
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+        }
+        std::cerr << "\n";
+        ++shot;
     }
+
+    log_info("Exiting (SIGINT received)");
+    return 0;
 }
