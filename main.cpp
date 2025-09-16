@@ -54,7 +54,7 @@ static bool post_image(const std::vector<uchar>& jpg, int shot) {
 
     curl_easy_setopt(curl, CURLOPT_URL, "https://coffee-maker.apifortytwo.com/api/observation");
     curl_easy_setopt(curl, CURLOPT_USERAGENT, "coffee-rpi/1.0");
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 10L);
     curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, 1L);
     curl_easy_setopt(curl, CURLOPT_VERBOSE, 1L); // libcurl debug to stderr
 
@@ -105,7 +105,7 @@ static bool post_image(const std::vector<uchar>& jpg, int shot) {
 
 int main() {
     signal(SIGINT, on_sigint);
-    log_info("Starting capture_uploader (interval 20s)");
+    log_info("Starting capture_uploader (interval 45s)");
 
 #if defined(USE_USB_CAM)
     cv::VideoCapture cap(0);
@@ -155,7 +155,7 @@ int main() {
         if (!ok) log_warn("Upload failed for shot #" + std::to_string(shot));
 
         // Countdown sleep so you see it's alive
-        for (int s = 45; s > 0 && !g_stop; --s) {
+        for (int s = 20; s > 0 && !g_stop; --s) {
             std::cerr << ts() << " [INFO]  Sleeping … " << s << "s     \r" << std::flush;
             std::this_thread::sleep_for(std::chrono::seconds(1));
         }
