@@ -9,11 +9,12 @@
 #include <vector>
 #include <string>
 #include <iomanip>
+#include <sstream>
 #include <signal.h>
 
 // -------- CONFIG: choose ONE of these --------
-// #define USE_USB_CAM            // uncomment to try /dev/video0
-#define USE_LIBCAMERA_GSTREAMER   // default for Pi cam via libcamera
+#define USE_USB_CAM                 // use /dev/video* (USB cam)
+// #define USE_LIBCAMERA_GSTREAMER   // Pi cam via libcamera/GStreamer
 
 static std::string ts() {
     using namespace std::chrono;
@@ -54,11 +55,11 @@ static bool post_image(const std::vector<uchar>& jpg, int shot) {
 
     curl_easy_setopt(curl, CURLOPT_URL, "https://coffee-maker.apifortytwo.com/api/observation");
     curl_easy_setopt(curl, CURLOPT_USERAGENT, "coffee-rpi/1.0");
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 10L);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
     curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, 1L);
     curl_easy_setopt(curl, CURLOPT_VERBOSE, 1L); // libcurl debug to stderr
 
-    // If you need auth, uncomment:
+    // Optional auth header:
     // struct curl_slist* headers = nullptr;
     // headers = curl_slist_append(headers, "Authorization: Bearer YOUR_TOKEN_HERE");
     // curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
@@ -94,6 +95,7 @@ static bool post_image(const std::vector<uchar>& jpg, int shot) {
 
     std::cerr << ts() << " [INFO]  HTTP status: " << http << "\n";
     std::cerr << ts() << " [INFO]  Response body: " << (resp.empty()? "<empty>" : resp) << "\n";
+
     if (http >= 200 && http < 300) {
         log_ok("Upload success (shot #" + std::to_string(shot) + ")");
         return true;
@@ -105,11 +107,19 @@ static bool post_image(const std::vector<uchar>& jpg, int shot) {
 
 int main() {
     signal(SIGINT, on_sigint);
-    log_info("Starting capture_uploader (interval 45s)");
+    log_info("Starting capture_uploader (interval 20s)");
+
+    // Global init/cleanup for libcurl
+    curl_global_init(CURL_GLOBAL_DEFAULT);
 
 #if defined(USE_USB_CAM)
-    cv::VideoCapture cap(0);
-    log_info("Opening camera: device index 0 (USB)");
+    // Prefer V4L2 backend for USB cams
+    cv::VideoCapture cap(0, cv::CAP_V4L2);
+    log_info("Opening camera: device index 0 (USB, V4L2)");
+    // Ask for common settings (camera may clamp to supported values)
+    cap.set(cv::CAP_PROP_FRAME_WIDTH, 1280);
+    cap.set(cv::CAP_PROP_FRAME_HEIGHT, 720);
+    cap.set(cv::CAP_PROP_FPS, 30);
 #elif defined(USE_LIBCAMERA_GSTREAMER)
     std::string pipeline =
         "libcamerasrc ! video/x-raw,width=1280,height=720,framerate=30/1 ! "
@@ -122,7 +132,8 @@ int main() {
 
     if (!cap.isOpened()) {
         log_err("Could not open camera (is OpenCV built with the right backend?)");
-        log_info("Tip: try switching to USE_USB_CAM or install GStreamer/libcamera support.");
+        log_info("Tips: try a different index (1/2), ensure user is in 'video' group, or switch backend.");
+        curl_global_cleanup();
         return 1;
     }
     log_ok("Camera opened");
@@ -154,7 +165,7 @@ int main() {
         bool ok = post_image(jpg, shot);
         if (!ok) log_warn("Upload failed for shot #" + std::to_string(shot));
 
-        // Countdown sleep so you see it's alive
+        // 20s countdown so you can see it's alive
         for (int s = 20; s > 0 && !g_stop; --s) {
             std::cerr << ts() << " [INFO]  Sleeping … " << s << "s     \r" << std::flush;
             std::this_thread::sleep_for(std::chrono::seconds(1));
@@ -164,5 +175,6 @@ int main() {
     }
 
     log_info("Exiting (SIGINT received)");
+    curl_global_cleanup();
     return 0;
 }
